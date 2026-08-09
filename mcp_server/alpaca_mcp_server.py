@@ -35,6 +35,13 @@ Run locally:
 """
 
 import os
+
+# Configure HuggingFace cache for Databricks serverless (read-only default cache)
+os.environ["HF_HOME"] = "/tmp/hf_cache"
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/tmp/hf_cache"
+os.environ["HF_HUB_CACHE"] = "/tmp/hf_cache"
+os.environ["TRANSFORMERS_CACHE"] = "/tmp/hf_cache"
+
 import logging
 import random
 import time
@@ -113,14 +120,14 @@ def get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
         logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL, cache_folder="/tmp/hf_cache")
     return _embedding_model
 
 # Table names from environment variables
 NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
 EMBEDDINGS_TABLE_NAME = os.environ.get("EMBEDDINGS_TABLE_NAME", "ticker_news_embeddings")
 CHUNK_EMBEDDINGS_TABLE_NAME = os.environ.get("CHUNK_EMBEDDINGS_TABLE_NAME", "ticker_news_chunk_embeddings")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
 
 # Context variable to store request headers for accessing end-user identity
 _request_context: ContextVar[dict] = ContextVar('request_context', default={})

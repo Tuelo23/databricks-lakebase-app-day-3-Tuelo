@@ -24,3 +24,11 @@ env:
     value: "alpaca-key-id"
   - name: ALPACA_SECRET_KEY_SECRET_KEY
     value: "alpaca-secret-key"
+  - name: EMBEDDING_MODEL
+    value: "BAAI/bge-large-en-v1.5"
+  - name: HF_HOME
+    value: "/tmp/hf_cache"
+  - name: SENTENCE_TRANSFORMERS_HOME
+    value: "/tmp/hf_cache"
+  - name: HF_HUB_CACHE
+    value: "/tmp/hf_cache"
