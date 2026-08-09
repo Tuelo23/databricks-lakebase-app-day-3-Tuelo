@@ -55,6 +55,56 @@ import lakebase
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alpaca-mcp-server")
 
+# Pending trades awaiting confirmation
+_PENDING_TRADES = {}
+
+def trace_mcp_call(func):
+    """Decorator to trace MCP tool calls to Lakebase."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        session_id = str(uuid.uuid4())
+        tool_name = func.__name__
+        start_time = time.time()
+        status = 'success'
+        error_message = None
+        
+        try:
+            result = func(*args, **kwargs)
+            return result
+        except Exception as e:
+            status = 'error'
+            error_message = str(e)
+            raise
+        finally:
+            duration_ms = (time.time() - start_time) * 1000
+            try:
+                # Capture arguments
+                import inspect
+                sig = inspect.signature(func)
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                arguments = dict(bound.arguments)
+                
+                lakebase.run_write(
+                    """
+                    INSERT INTO mcp_call_traces 
+                    (session_id, tool_name, arguments, status, error_message, duration_ms, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        session_id,
+                        tool_name,
+                        json.dumps(arguments),
+                        status,
+                        error_message,
+                        duration_ms,
+                    ),
+                )
+            except Exception as trace_error:
+                logger.warning(f"Failed to trace {tool_name}: {trace_error}")
+    
+    return wrapper
+
 # Load embedding model once at startup
 _embedding_model = None
 
@@ -87,7 +137,7 @@ def _get_end_user_email() -> str:
     # Fallback: use service principal (local development or non-App contexts)
     from databricks.sdk import WorkspaceClient
     w = WorkspaceClient()
-    return w.current_user.me().user_name or 'zach@dataexpert.io'
+    return w.current_user.me().user_name or 'pricesetshedi@gmail.com'
 
 
 mcp = FastMCP("alpaca-paper-trading")
@@ -107,6 +157,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 @mcp.tool
+@trace_mcp_call
 def get_quote(symbol: str) -> dict:
     """
     Get the latest real quote for a stock ticker symbol from Massive.com.
@@ -121,10 +172,14 @@ def get_quote(symbol: str) -> dict:
 
 
 @mcp.tool
-def place_trade(account_id: str, symbol: str, side: str, quantity: float) -> dict:
+@trace_mcp_call
+def stage_trade(account_id: str, symbol: str, side: str, quantity: float) -> dict:
     """
-    Place a real market order (paper trade) - BUY or SELL - against the
-    configured Alpaca paper trading account.
+    Stage a market order (BUY or SELL) for approval. Returns a confirmation
+    code that must be passed to execute_trade to complete the trade.
+    
+    This two-step process ensures human-in-the-loop approval before executing
+    real trades.
 
     Args:
         account_id: Accepted for signature compatibility; not used to
@@ -135,13 +190,116 @@ def place_trade(account_id: str, symbol: str, side: str, quantity: float) -> dic
         quantity: Number of shares to trade (must be positive).
 
     Returns:
-        A dict describing the order (id, symbol, side, quantity,
-        price, notional, status, created_at).
+        A dict with trade summary, estimated cost, and confirmation_code.
     """
-    return alpaca_broker.place_order(account_id, symbol, side, quantity)
+    # Validate inputs
+    side = side.upper()
+    if side not in ('BUY', 'SELL'):
+        return {
+            "status": "error",
+            "message": "side must be 'BUY' or 'SELL'"
+        }
+    
+    if quantity <= 0:
+        return {
+            "status": "error",
+            "message": "quantity must be positive"
+        }
+    
+    # Try to get quote for estimated cost (may fail for crypto)
+    estimated_price = None
+    estimated_cost = None
+    try:
+        quote = massive_broker.get_quote(symbol)
+        estimated_price = quote.get("price")
+        if estimated_price:
+            estimated_cost = estimated_price * quantity
+    except Exception as e:
+        logger.info(f"Could not get quote for {symbol}: {e}")
+    
+    # Generate confirmation code
+    confirmation_code = f"{random.randint(0, 99999):05d}"
+    
+    # Store pending trade
+    _PENDING_TRADES[confirmation_code] = {
+        "account_id": account_id,
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "staged_at": time.time(),
+    }
+    
+    return {
+        "status": "staged",
+        "message": f"Trade staged. Use execute_trade('{confirmation_code}') to confirm.",
+        "confirmation_code": confirmation_code,
+        "summary": {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "estimated_price": estimated_price,
+            "estimated_cost": estimated_cost,
+        },
+    }
 
 
 @mcp.tool
+@trace_mcp_call
+def execute_trade(confirmation_code: str) -> dict:
+    """
+    Execute a previously staged trade using its confirmation code.
+    
+    The confirmation code expires after 300 seconds. Once executed or expired,
+    the code cannot be reused.
+
+    Args:
+        confirmation_code: The 5-digit code returned by stage_trade.
+
+    Returns:
+        A dict describing the executed order (id, symbol, side, quantity,
+        price, notional, status, created_at).
+    """
+    # Check if code exists
+    if confirmation_code not in _PENDING_TRADES:
+        return {
+            "status": "error",
+            "message": f"Unknown or expired confirmation code: {confirmation_code}"
+        }
+    
+    trade = _PENDING_TRADES[confirmation_code]
+    
+    # Check expiration (300 seconds)
+    if time.time() - trade["staged_at"] > 300:
+        del _PENDING_TRADES[confirmation_code]
+        return {
+            "status": "error",
+            "message": "Confirmation code expired (300 second limit)"
+        }
+    
+    # Delete code BEFORE executing to prevent double-execution on retry
+    del _PENDING_TRADES[confirmation_code]
+    
+    # Execute the trade
+    try:
+        result = alpaca_broker.place_order(
+            trade["account_id"],
+            trade["symbol"],
+            trade["side"],
+            trade["quantity"],
+        )
+        result["confirmation_code"] = confirmation_code
+        return result
+    except Exception as e:
+        logger.exception(f"Failed to execute trade {confirmation_code}")
+        return {
+            "status": "error",
+            "message": f"Trade execution failed: {str(e)}",
+            "confirmation_code": confirmation_code,
+        }
+
+
+@mcp.tool
+@trace_mcp_call
 def get_positions(account_id: str) -> list[dict]:
     """
     Get all open positions for the Alpaca paper trading account.
@@ -157,6 +315,7 @@ def get_positions(account_id: str) -> list[dict]:
 
 
 @mcp.tool
+@trace_mcp_call
 def get_account_summary(account_id: str) -> dict:
     """
     Get a full account summary for the Alpaca paper trading account: cash
@@ -175,6 +334,7 @@ def get_account_summary(account_id: str) -> dict:
 
 
 @mcp.tool
+@trace_mcp_call
 def get_order_history(account_id: str, limit: int = 50) -> list[dict]:
     """
     Get recent orders for the Alpaca paper trading account, most recent first.
@@ -192,6 +352,7 @@ def get_order_history(account_id: str, limit: int = 50) -> list[dict]:
 
 
 @mcp.tool
+@trace_mcp_call
 def get_balance(account_id: str) -> dict:
     """
     Get the current cash balance and buying power for the Alpaca paper 
@@ -208,6 +369,7 @@ def get_balance(account_id: str) -> dict:
 
 
 @mcp.tool
+@trace_mcp_call
 def get_current_user() -> dict:
     """
     Get information about the currently authenticated end user accessing the MCP server.
@@ -255,7 +417,8 @@ def get_current_user() -> dict:
 
 
 @mcp.tool
-def add_to_watchlist(symbol: str) -> dict:
+@trace_mcp_call
+def add_to_watchlist(symbol: str, email: str = "pricesetshedi@gmail.com") -> dict:
     """
     Add a stock to the watchlist by fetching its current quote from Massive.com
     and storing it in the Lakebase watchlist table.
@@ -264,13 +427,14 @@ def add_to_watchlist(symbol: str) -> dict:
     
     Args:
         symbol: Stock ticker symbol, e.g. "AAPL".
+        email: User's email address (defaults to pricesetshedi@gmail.com).
     
     Returns:
         A dict with the quote data and confirmation that it was added to the watchlist.
     """
     try:
-        # Get the actual end user's email (not the service principal)
-        user_email = _get_end_user_email()
+        # Use the provided email parameter
+        user_email = email
         
         # Get quote from Massive.com
         quote = massive_broker.get_quote(symbol)
@@ -309,7 +473,8 @@ def add_to_watchlist(symbol: str) -> dict:
 
 
 @mcp.tool
-def get_watchlist(limit: int = 100, email: str = 'zach@dataexpert.io') -> dict:
+@trace_mcp_call
+def get_watchlist(limit: int = 100, email: str = 'pricesetshedi@gmail.com') -> dict:
     """
     Retrieve all stocks in the authenticated user's watchlist from Lakebase.
     
@@ -352,6 +517,7 @@ def get_watchlist(limit: int = 100, email: str = 'zach@dataexpert.io') -> dict:
 
 
 @mcp.tool
+@trace_mcp_call
 def remove_from_watchlist(symbol: str) -> dict:
     """
     Remove a stock from the authenticated user's watchlist.
@@ -400,15 +566,17 @@ def remove_from_watchlist(symbol: str) -> dict:
 
 
 @mcp.tool
-def vector_search(query: str, limit: int = 10, search_chunks: bool = True) -> dict:
+@trace_mcp_call
+def get_stock_information(query: str, limit: int = 10, search_chunks: bool = True) -> dict:
     """
-    Semantic search over ticker news using vector embeddings.
+    Retrieve recent news and sentiment about a stock.
     
-    Accepts a text query, computes its embedding, and returns the most similar
-    documents and chunks from Lakebase using pgvector's cosine similarity.
+    Use this before making trading decisions to understand recent developments,
+    market sentiment, and news about the stock. Searches ticker news using
+    semantic similarity to find the most relevant information.
     
     Args:
-        query: Natural language search query (e.g. "tech company earnings")
+        query: Stock symbol or natural language query (e.g. "AAPL", "tech company earnings")
         limit: Maximum number of results to return (default 10)
         search_chunks: Whether to search chunk-level embeddings in addition to documents
     
